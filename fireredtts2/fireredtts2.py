@@ -465,7 +465,7 @@ class FireRedTTS2_Stream(FireRedTTS2):
         yield audio_chunk.squeeze(0)
 
     def generate_single(
-        self, context: List[Segment], temperature: float = 0.9, topk: int = 20
+        self, context: List[Segment], temperature: float = 0.9, topk: int = 20, abort_event=None
     ):
         self._model.reset_caches()
         max_generation_len = 400
@@ -487,6 +487,10 @@ class FireRedTTS2_Stream(FireRedTTS2):
         )
 
         for _ in range(max_generation_len):
+            # Check for abort before expensive GPU operation
+            if abort_event and abort_event.is_set():
+                return
+            
             # sample: (1, nq)
             sample = self._model.generate_frame(
                 curr_tokens, curr_tokens_mask, curr_pos, temperature, topk
@@ -566,7 +570,7 @@ class FireRedTTS2_Stream(FireRedTTS2):
 
     @torch.inference_mode()
     def generate_monologue(
-        self, text, prompt_wav=None, prompt_text=None, temperature=0.75, topk=20
+        self, text, prompt_wav=None, prompt_text=None, temperature=0.75, topk=20, abort_event=None
     ):
         # step1. construct context
         if prompt_wav is not None:
@@ -582,6 +586,10 @@ class FireRedTTS2_Stream(FireRedTTS2):
             tokens: List[torch.Tensor] = []
             codec_cache = {}
             for text in text_list:
+                # Check for abort before processing each text segment
+                if abort_event and abort_event.is_set():
+                    return
+                
                 text = clean_text(text=text)
                 input_text = prompt_text[:-1] + "," + text
                 prompt_a = self.prepare_prompt(
@@ -590,9 +598,13 @@ class FireRedTTS2_Stream(FireRedTTS2):
                 context = [prompt_a]
 
                 token_generator = self.generate_single(
-                    context=context, temperature=temperature, topk=topk
+                    context=context, temperature=temperature, topk=topk, abort_event=abort_event
                 )
                 for token in token_generator:
+                    # Check for abort in token generation loop
+                    if abort_event and abort_event.is_set():
+                        return
+                    
                     # token: (1, nq)
                     if len(tokens) > 2:
                         # generate previous token
@@ -604,13 +616,14 @@ class FireRedTTS2_Stream(FireRedTTS2):
                         yield audio_chunk.cpu()
                     tokens.append(token)
 
-            # process last token
-            audio_chunk, codec_cache = self._audio_tokenizer.decode_one_token(
-                tokens[-1].unsqueeze(-1),
-                codec_cache,
-                last_token=True,
-            )
-            yield audio_chunk.cpu()
+            # process last token if not aborted
+            if not (abort_event and abort_event.is_set()) and tokens:
+                audio_chunk, codec_cache = self._audio_tokenizer.decode_one_token(
+                    tokens[-1].unsqueeze(-1),
+                    codec_cache,
+                    last_token=True,
+                )
+                yield audio_chunk.cpu()
         else:
             # random speaker
             text = clean_text(text=text.strip())
@@ -623,6 +636,8 @@ class FireRedTTS2_Stream(FireRedTTS2):
                 topk=topk,
             )
             for audio_chunk in audio_generator:
+                if abort_event and abort_event.is_set():
+                    return
                 yield audio_chunk.unsqueeze(0).cpu()
 
     
